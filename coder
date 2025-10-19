@@ -1,0 +1,187 @@
+#!/bin/bash
+
+# Config file location
+CONFIG_FILE="$HOME/.config/coder/config"
+CONFIG_DIR="$(dirname "$CONFIG_FILE")"
+
+# Initialize config
+init_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        mkdir -p "$CONFIG_DIR"
+        
+        gum style --foreground 212 --bold "First time setup"
+        echo ""
+        
+        projects_path=$(gum input --placeholder "Enter the path to your projects folder (e.g. ~/projects)")
+        
+        # Expand tilde if present
+        projects_path="${projects_path/#\~/$HOME}"
+        
+        # Validate path
+        if [[ ! -d "$projects_path" ]]; then
+            gum style --foreground 196 "Error: Directory does not exist"
+            exit 1
+        fi
+        
+        echo "PROJECTS_PATH=\"$projects_path\"" > "$CONFIG_FILE"
+        gum style --foreground 46 "Configuration saved!"
+        echo ""
+    fi
+}
+
+# Load config
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        source "$CONFIG_FILE"
+    else
+        gum style --foreground 196 "Config file not found"
+        exit 1
+    fi
+}
+
+# Get recently modified folders
+get_folders() {
+    local base_path="$1"
+    
+    # Use ls to list directories sorted by modification time (newest first)
+    ls -1td "$base_path"/*/ 2>/dev/null
+}
+
+# Create new project folder
+create_new_project() {
+    gum style --foreground 212 --bold "Create New Project"
+    echo ""
+    
+    # Get project name from user
+    local project_name
+    project_name=$(gum input --placeholder "Enter project name")
+    
+    if [[ -z "$project_name" ]]; then
+        gum style --foreground 208 "No project name provided. Goodbye!"
+        exit 0
+    fi
+    
+    # Clean up project name (remove special characters, replace spaces with hyphens)
+    project_name=$(echo "$project_name" | sed 's/[^a-zA-Z0-9 _-]//g' | sed 's/ /-/g')
+    
+    if [[ -z "$project_name" ]]; then
+        gum style --foreground 196 "Error: Invalid project name after cleanup"
+        exit 1
+    fi
+    
+    local project_path="$PROJECTS_PATH/$project_name"
+    
+    # Check if folder already exists
+    if [[ -d "$project_path" ]]; then
+        gum style --foreground 208 "Folder '$project_name' already exists. Opening existing folder..."
+        code "$project_path"
+        exit 0
+    fi
+    
+    # Create the folder
+    if mkdir -p "$project_path"; then
+        gum style --foreground 46 "Created project: $project_name"
+        gum style --foreground 46 "Opening: $project_name"
+        code "$project_path"
+        exit 0
+    else
+        gum style --foreground 196 "Error: Failed to create project folder"
+        exit 1
+    fi
+}
+
+# Display project selection menu using gum filter for fuzzy finding
+display_menu() {
+    local folders=("$@")
+    
+    # Prepare display options with numbered folder names and modification times
+    local options=()
+    local folder_paths=()
+    local counter=1
+    
+    # Add "Create New Project" option at the top
+    options+=("Create New Project")
+    folder_paths+=("__CREATE_NEW__")
+    
+    # Add existing folders
+    for folder in "${folders[@]}"; do
+        local folder_name=$(basename "$folder")
+        local mod_time=$(stat -c %Y "$folder" 2>/dev/null)
+        local formatted_time=$(date -d @"$mod_time" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "Unknown")
+        
+        # Store the numbered display string and the actual path separately
+        options+=("$counter. $folder_name ($formatted_time)")
+        folder_paths+=("$folder")
+        ((counter++))
+    done
+    
+    # If no existing folders, still show the create option
+    if [[ ${#folders[@]} -eq 0 ]]; then
+        gum style --foreground 208 "No existing folders found in $PROJECTS_PATH"
+        echo ""
+    fi
+    
+    # Use gum filter for fuzzy finding
+    gum style --foreground 75 --bold "Projects (start typing to filter)"
+    echo ""
+    
+    local selected_option 
+    selected_option=$(printf '%s\n' "${options[@]}" | gum filter --height 20 --indicator "▸" --prompt ">" --placeholder "")
+    # Handle the selection
+    if [[ -n "$selected_option" ]]; then
+        # Check if "Create New Project" was selected
+        if [[ "$selected_option" == "Create New Project" ]]; then
+            create_new_project
+        else
+            # Find the selected folder path
+            for i in "${!options[@]}"; do
+                if [[ "${options[$i]}" == "$selected_option" ]]; then
+                    local chosen_folder="${folder_paths[$i]}"
+                    gum style --foreground 46 "Opening: $(basename "$chosen_folder")"
+                    code "$chosen_folder"
+                    exit 0
+                fi
+            done
+        fi
+    else
+        gum style --foreground 208 "Goodbye!"
+        exit 0
+    fi
+}
+
+# Main function
+main() {
+
+    # Check if required tools exist
+
+    if ! command -v gum &> /dev/null; then
+        echo "Error: 'gum' is required but not installed."
+        echo "Try apt/dnf/brew install gum"
+    fi
+
+    if ! command -v code &> /dev/null; then
+        gum style --foreground 196 "Error: VSCode 'code' command not found"
+        echo "Please install VSCode and ensure the 'code' command is in your PATH"
+        exit 1
+    fi
+    
+    # Initialize or load config
+    init_config
+    load_config
+    
+    # Validate projects path
+    if [[ ! -d "$PROJECTS_PATH" ]]; then
+        gum style --foreground 196 "Error: Projects path '$PROJECTS_PATH' does not exist"
+        echo "Please check your configuration in $CONFIG_FILE"
+        exit 1
+    fi
+    
+    # Get folders
+    mapfile -t folders < <(get_folders "$PROJECTS_PATH")
+    
+    # Display menu (handles empty folder case internally)
+    display_menu "${folders[@]}"
+}
+
+# Run main function
+main "$@"
