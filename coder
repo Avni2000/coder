@@ -137,8 +137,12 @@ display_menu() {
             for i in "${!options[@]}"; do
                 if [[ "${options[$i]}" == "$selected_option" ]]; then
                     local chosen_folder="${folder_paths[$i]}"
-                    gum style --foreground 46 "Opening: $(basename "$chosen_folder")"
+                    gum style --foreground 46 "Opening: $(basename "$chosen_folder") lalalala"
                     code "$chosen_folder"
+                    
+                    # Close the terminal by sending SIGHUP to parent shell
+                    # This tells the parent shell to hang up
+                    kill -HUP $PPID 2>/dev/null
                     exit 0
                 fi
             done

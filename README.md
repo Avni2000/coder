@@ -2,8 +2,15 @@
 
 A minimal bash script to launch coding projects in a given directory
 
-## Usage
+## Install/Setup
+1. Download the `coder` executable to a directory of your choice
+2. Create a symlink to make it globally accessible:
+    ```bash
+    ln -s <path-to-coder-executable> /usr/bin/coder
+    ```
+    (Or link to any directory in your `$PATH`)
 
+## Usage
 Simply type `coder` in your terminal to launch the interface.
 
 ## Features
@@ -26,4 +33,4 @@ Simply type `coder` in your terminal to launch the interface.
 
 ## Contributing
 
-Lemme know if you have more feature ideas!
+Let me know if you have more feature ideas!
