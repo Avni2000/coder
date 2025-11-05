@@ -90,67 +90,156 @@ create_new_project() {
     fi
 }
 
+# Explore subfolders of a selected folder
+explore_subfolders() {
+    local parent_folder="$1"
+    local parent_name="$2"
+    
+    # Get subfolders
+    local subfolders=()
+    while IFS= read -r -d '' subfolder; do
+        subfolders+=("$subfolder")
+    done < <(find "$parent_folder" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null | sort -z)
+    
+    if [[ ${#subfolders[@]} -eq 0 ]]; then
+        gum style --foreground 208 "No subfolders found in $parent_name"
+        sleep 1
+        return 1
+    fi
+    
+    # Prepare subfolder options
+    local sub_options=()
+    local sub_paths=()
+    
+    # Add back navigation option
+    sub_options+=("← Back to main menu")
+    sub_paths+=("__BACK__")
+    
+    # Add parent folder as an option
+    sub_options+=("📁 Open $parent_name (parent folder)")
+    sub_paths+=("$parent_folder")
+    
+    # Add subfolders
+    for subfolder in "${subfolders[@]}"; do
+        local subfolder_name=$(basename "$subfolder")
+        sub_options+=("  $subfolder_name/")
+        sub_paths+=("$subfolder")
+    done
+    
+    # Display submenu
+    gum style --foreground 75 --bold "Subfolders in: $parent_name"
+    echo ""
+    
+    local selected_sub
+    selected_sub=$(printf '%s\n' "${sub_options[@]}" | gum filter --height 20 --indicator "▸" --prompt ">" --placeholder "")
+    
+    if [[ -n "$selected_sub" ]]; then
+        # Find the selected path
+        for i in "${!sub_options[@]}"; do
+            if [[ "${sub_options[$i]}" == "$selected_sub" ]]; then
+                local chosen_path="${sub_paths[$i]}"
+                
+                if [[ "$chosen_path" == "__BACK__" ]]; then
+                    return 1  # Signal to go back
+                else
+                    gum style --foreground 46 "Opening: $(basename "$chosen_path")"
+                    code "$chosen_path"
+                    
+                    # Close the terminal
+                    kill -HUP $PPID 2>/dev/null
+                    exit 0
+                fi
+            fi
+        done
+    else
+        return 1  # User cancelled, go back
+    fi
+}
+
 # Display project selection menu using gum filter for fuzzy finding
 display_menu() {
     local folders=("$@")
     
-    # Prepare display options with numbered folder names and modification times
-    local options=()
-    local folder_paths=()
-    local counter=1
-    
-    # Add "Create New Project" option at the top
-    options+=("Create New Project")
-    folder_paths+=("__CREATE_NEW__")
-    
-    # Add existing folders
-    for folder in "${folders[@]}"; do
-        local folder_name=$(basename "$folder")
-        local mod_time=$(stat -c %Y "$folder" 2>/dev/null)
-        local formatted_time=$(date -d @"$mod_time" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "Unknown")
+    while true; do
+        # Prepare display options with numbered folder names and modification times
+        local options=()
+        local folder_paths=()
+        local counter=1
         
-        # Store the numbered display string and the actual path separately
-        options+=("$counter. $folder_name ($formatted_time)")
-        folder_paths+=("$folder")
-        ((counter++))
-    done
-    
-    # If no existing folders, still show the create option
-    if [[ ${#folders[@]} -eq 0 ]]; then
-        gum style --foreground 208 "No existing folders found in $PROJECTS_PATH"
-        echo ""
-    fi
-    
-    # Use gum filter for fuzzy finding
-    gum style --foreground 75 --bold "Projects (start typing to filter)"
-    echo ""
-    
-    local selected_option 
-    selected_option=$(printf '%s\n' "${options[@]}" | gum filter --height 20 --indicator "▸" --prompt ">" --placeholder "")
-    # Handle the selection
-    if [[ -n "$selected_option" ]]; then
-        # Check if "Create New Project" was selected
-        if [[ "$selected_option" == "Create New Project" ]]; then
-            create_new_project
-        else
-            # Find the selected folder path
-            for i in "${!options[@]}"; do
-                if [[ "${options[$i]}" == "$selected_option" ]]; then
-                    local chosen_folder="${folder_paths[$i]}"
-                    gum style --foreground 46 "Opening: $(basename "$chosen_folder") lalalala"
-                    code "$chosen_folder"
-                    
-                    # Close the terminal by sending SIGHUP to parent shell
-                    # This tells the parent shell to hang up
-                    kill -HUP $PPID 2>/dev/null
-                    exit 0
-                fi
-            done
+        # Add "Create New Project" option at the top
+        options+=("Create New Project")
+        folder_paths+=("__CREATE_NEW__")
+        
+        # Add existing folders
+        for folder in "${folders[@]}"; do
+            local folder_name=$(basename "$folder")
+            local mod_time=$(stat -c %Y "$folder" 2>/dev/null)
+            local formatted_time=$(date -d @"$mod_time" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "Unknown")
+            
+            # Store the numbered display string and the actual path separately
+            options+=("$counter. $folder_name ($formatted_time)")
+            folder_paths+=("$folder")
+            ((counter++))
+        done
+        
+        # If no existing folders, still show the create option
+        if [[ ${#folders[@]} -eq 0 ]]; then
+            gum style --foreground 208 "No existing folders found in $PROJECTS_PATH"
+            echo ""
         fi
-    else
-        gum style --foreground 208 "Goodbye!"
-        exit 0
-    fi
+        
+        # Use gum filter for fuzzy finding
+        gum style --foreground 75 --bold "Projects (start typing to filter, press Ctrl+O then 'e' for subfolders)"
+        echo ""
+        
+        local selected_option 
+        selected_option=$(printf '%s\n' "${options[@]}" | gum filter --height 20 --indicator "▸" --prompt ">" --placeholder "")
+        
+        # Handle the selection
+        if [[ -n "$selected_option" ]]; then
+            # Check if "Create New Project" was selected
+            if [[ "$selected_option" == "Create New Project" ]]; then
+                create_new_project
+            else
+                # Find the selected folder path
+                for i in "${!options[@]}"; do
+                    if [[ "${options[$i]}" == "$selected_option" ]]; then
+                        local chosen_folder="${folder_paths[$i]}"
+                        local folder_name=$(basename "$chosen_folder")
+                        
+                        # Ask user what to do with the folder
+                        gum style --foreground 75 "Selected: $folder_name"
+                        local action
+                        action=$(printf '%s\n' "Open in VS Code" "Explore subfolders" "Cancel" | gum choose --header "What would you like to do?")
+                        
+                        case "$action" in
+                            "Open in VS Code")
+                                gum style --foreground 46 "Opening: $folder_name"
+                                code "$chosen_folder"
+                                kill -HUP $PPID 2>/dev/null
+                                exit 0
+                                ;;
+                            "Explore subfolders")
+                                if ! explore_subfolders "$chosen_folder" "$folder_name"; then
+                                    # User went back, continue the loop to show main menu again
+                                    continue
+                                fi
+                                ;;
+                            *)
+                                # Cancel or empty, go back to menu
+                                continue
+                                ;;
+                        esac
+                        
+                        break
+                    fi
+                done
+            fi
+        else
+            gum style --foreground 208 "Goodbye!"
+            exit 0
+        fi
+    done
 }
 
 # Main function
