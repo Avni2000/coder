@@ -1,280 +1,827 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
 
-# Config file location
-CONFIG_FILE="$HOME/.config/coder/config"
-CONFIG_DIR="$(dirname "$CONFIG_FILE")"
+APP_NAME="coder"
+VERSION="2.0.0"
 
-# Initialize config
-init_config() {
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-        mkdir -p "$CONFIG_DIR"
-        
-        gum style --foreground 212 --bold "First time setup"
-        echo ""
-        
-        projects_path=$(gum input --placeholder "Enter the path to your projects folder (e.g. ~/projects)")
-        
-        # Expand tilde if present
-        projects_path="${projects_path/#\~/$HOME}"
-        
-        # Validate path
-        if [[ ! -d "$projects_path" ]]; then
-            gum style --foreground 196 "Error: Directory does not exist"
-            exit 1
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/coder"
+CONFIG_FILE="$CONFIG_DIR/config"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/coder"
+PROJECT_CACHE_FILE="$CACHE_DIR/projects.tsv"
+RECENTS_FILE="$CACHE_DIR/recents"
+
+declare PROJECTS_PATH=""
+declare EDITOR_CMD=""
+declare CACHE_TTL_SECONDS=120
+declare MAX_RECENTS=25
+
+declare -a PROJECT_NAMES=()
+declare -a PROJECT_PATHS=()
+declare -a PROJECT_MTIMES=()
+
+has_command() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+has_gum() {
+    has_command gum
+}
+
+style_message() {
+    local color="$1"
+    shift
+
+    if has_gum; then
+        gum style --foreground "$color" "$*"
+    else
+        printf '%s\n' "$*"
+    fi
+}
+
+style_header() {
+    local color="$1"
+    shift
+
+    if has_gum; then
+        gum style --foreground "$color" --bold "$*"
+    else
+        printf '%s\n' "$*"
+    fi
+}
+
+die() {
+    style_message 196 "Error: $*" >&2
+    exit 1
+}
+
+trim_whitespace() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+expand_path() {
+    local path="$1"
+
+    case "$path" in
+        "~")
+            printf '%s' "$HOME"
+            ;;
+        "~/"*)
+            printf '%s/%s' "$HOME" "${path#~/}"
+            ;;
+        *)
+            printf '%s' "$path"
+            ;;
+    esac
+}
+
+detect_default_editor() {
+    if [[ -n "${CODER_EDITOR_CMD:-}" ]]; then
+        printf '%s' "$CODER_EDITOR_CMD"
+        return
+    fi
+
+    if has_command code; then
+        printf '%s' "code"
+        return
+    fi
+
+    if [[ -n "${EDITOR:-}" ]]; then
+        local editor_bin="${EDITOR%% *}"
+        if [[ -n "$editor_bin" ]] && has_command "$editor_bin"; then
+            printf '%s' "$editor_bin"
+            return
         fi
-        
-        echo "PROJECTS_PATH=\"$projects_path\"" > "$CONFIG_FILE"
-        gum style --foreground 46 "Configuration saved!"
-        echo ""
     fi
+
+    if has_command nvim; then
+        printf '%s' "nvim"
+        return
+    fi
+
+    if has_command vim; then
+        printf '%s' "vim"
+        return
+    fi
+
+    printf '%s' ""
 }
 
-# Load config
+ensure_cache_dir() {
+    if mkdir -p "$CACHE_DIR" 2>/dev/null; then
+        return
+    fi
+
+    local fallback_base="${TMPDIR:-/tmp}"
+    local fallback_dir="$fallback_base/${APP_NAME}-${USER:-user}"
+
+    if mkdir -p "$fallback_dir" 2>/dev/null; then
+        CACHE_DIR="$fallback_dir"
+        PROJECT_CACHE_FILE="$CACHE_DIR/projects.tsv"
+        RECENTS_FILE="$CACHE_DIR/recents"
+        return
+    fi
+
+    die "Could not create cache directory at '$CACHE_DIR' or '$fallback_dir'"
+}
+
+write_config() {
+    local projects_path="$1"
+    local editor_cmd="$2"
+
+    mkdir -p "$CONFIG_DIR"
+
+    {
+        printf '# %s configuration\n' "$APP_NAME"
+        printf 'PROJECTS_PATH=%q\n' "$projects_path"
+        printf 'EDITOR_CMD=%q\n' "$editor_cmd"
+        printf 'CACHE_TTL_SECONDS=%q\n' "120"
+        printf 'MAX_RECENTS=%q\n' "25"
+    } > "$CONFIG_FILE"
+}
+
+run_setup() {
+    local force="${1:-false}"
+
+    if [[ -f "$CONFIG_FILE" && "$force" != "true" ]]; then
+        return
+    fi
+
+    local projects_path=""
+    local editor_cmd=""
+    local default_projects="$HOME/projects"
+    local default_editor
+    default_editor="$(detect_default_editor)"
+
+    style_header 212 "${APP_NAME} setup"
+
+    if has_gum; then
+        printf '\n'
+        projects_path=$(gum input --placeholder "Path to your projects folder" --value "$default_projects")
+
+        if [[ -z "$default_editor" ]]; then
+            editor_cmd=$(gum input --placeholder "Editor command (e.g. code, nvim)")
+        else
+            editor_cmd=$(gum input --placeholder "Editor command" --value "$default_editor")
+        fi
+    else
+        printf 'Projects path [%s]: ' "$default_projects"
+        read -r projects_path
+        printf 'Editor command [%s]: ' "${default_editor:-code}"
+        read -r editor_cmd
+    fi
+
+    projects_path="$(trim_whitespace "$projects_path")"
+    editor_cmd="$(trim_whitespace "$editor_cmd")"
+
+    if [[ -z "$projects_path" ]]; then
+        projects_path="$default_projects"
+    fi
+
+    if [[ -z "$editor_cmd" ]]; then
+        editor_cmd="$default_editor"
+    fi
+
+    projects_path="$(expand_path "$projects_path")"
+
+    [[ -d "$projects_path" ]] || die "Directory does not exist: $projects_path"
+    [[ -n "$editor_cmd" ]] || die "Could not infer a default editor. Set one manually."
+
+    write_config "$projects_path" "$editor_cmd"
+    style_message 46 "Configuration saved to $CONFIG_FILE"
+}
+
 load_config() {
-    if [[ -f "$CONFIG_FILE" ]]; then
-        source "$CONFIG_FILE"
-    else
-        gum style --foreground 196 "Config file not found"
-        exit 1
+    run_setup false
+
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+
+    PROJECTS_PATH="$(expand_path "${PROJECTS_PATH:-}")"
+    EDITOR_CMD="${CODER_EDITOR_CMD:-${EDITOR_CMD:-}}"
+
+    if [[ -z "$EDITOR_CMD" ]]; then
+        EDITOR_CMD="$(detect_default_editor)"
+    fi
+
+    CACHE_TTL_SECONDS="${CACHE_TTL_SECONDS:-120}"
+    MAX_RECENTS="${MAX_RECENTS:-25}"
+
+    [[ "$CACHE_TTL_SECONDS" =~ ^[0-9]+$ ]] || CACHE_TTL_SECONDS=120
+    [[ "$MAX_RECENTS" =~ ^[0-9]+$ ]] || MAX_RECENTS=25
+
+    if (( MAX_RECENTS < 1 )); then
+        MAX_RECENTS=25
+    fi
+
+    ensure_cache_dir
+
+    [[ -n "$PROJECTS_PATH" ]] || die "PROJECTS_PATH is empty in $CONFIG_FILE"
+    [[ -d "$PROJECTS_PATH" ]] || die "Configured projects directory does not exist: $PROJECTS_PATH"
+}
+
+editor_bin() {
+    local -a cmd_parts=()
+    read -r -a cmd_parts <<< "$EDITOR_CMD"
+    printf '%s' "${cmd_parts[0]:-}"
+}
+
+ensure_editor_available() {
+    local bin
+    bin="$(editor_bin)"
+
+    [[ -n "$bin" ]] || die "EDITOR_CMD is empty in $CONFIG_FILE"
+    has_command "$bin" || die "Editor command not found: $bin"
+}
+
+normalize_project_name() {
+    local raw="$1"
+    local trimmed
+
+    trimmed="$(trim_whitespace "$raw")"
+    trimmed="${trimmed// /-}"
+
+    printf '%s' "$trimmed" | sed -E 's/[^[:alnum:]._-]+/-/g; s/-+/-/g; s/^-+//; s/-+$//'
+}
+
+record_recent_project() {
+    local project_path="$1"
+
+    mkdir -p "$CACHE_DIR"
+
+    local tmp_file
+    tmp_file="$(mktemp "$CACHE_DIR/recents.XXXXXX")"
+
+    awk -v max="$MAX_RECENTS" '
+        NF && !seen[$0]++ {
+            print
+            count++
+            if (count >= max) {
+                exit
+            }
+        }
+    ' < <(
+        printf '%s\n' "$project_path"
+        if [[ -f "$RECENTS_FILE" ]]; then
+            cat "$RECENTS_FILE"
+        fi
+    ) > "$tmp_file"
+
+    mv "$tmp_file" "$RECENTS_FILE"
+}
+
+open_path_in_editor() {
+    local target="$1"
+
+    [[ -d "$target" ]] || die "Target path does not exist: $target"
+
+    ensure_editor_available
+    record_recent_project "$target"
+
+    local -a cmd_parts=()
+    read -r -a cmd_parts <<< "$EDITOR_CMD"
+
+    "${cmd_parts[@]}" "$target"
+}
+
+build_project_cache() {
+    mkdir -p "$CACHE_DIR"
+
+    local tmp_file
+    tmp_file="$(mktemp "$CACHE_DIR/projects.XXXXXX")"
+
+    printf '#coder-cache\t%s\t%s\n' "$PROJECTS_PATH" "$(date +%s)" > "$tmp_file"
+
+    LC_ALL=C sort -r -n < <(
+        find "$PROJECTS_PATH" -mindepth 1 -maxdepth 1 -type d -printf '%T@\t%f\t%p\n' 2>/dev/null
+    ) >> "$tmp_file"
+
+    mv "$tmp_file" "$PROJECT_CACHE_FILE"
+}
+
+cache_header_valid() {
+    [[ -f "$PROJECT_CACHE_FILE" ]] || return 1
+
+    local tag=""
+    local cache_path=""
+    local cache_time=""
+
+    IFS=$'\t' read -r tag cache_path cache_time < "$PROJECT_CACHE_FILE" || return 1
+
+    [[ "$tag" == "#coder-cache" ]] || return 1
+    [[ "$cache_path" == "$PROJECTS_PATH" ]] || return 1
+    [[ "$cache_time" =~ ^[0-9]+$ ]] || return 1
+}
+
+cache_is_fresh() {
+    cache_header_valid || return 1
+
+    local tag=""
+    local cache_path=""
+    local cache_time=""
+    local now=""
+
+    IFS=$'\t' read -r tag cache_path cache_time < "$PROJECT_CACHE_FILE"
+    now="$(date +%s)"
+
+    (( now - cache_time <= CACHE_TTL_SECONDS ))
+}
+
+ensure_project_cache() {
+    local force="${1:-false}"
+
+    if [[ "$force" == "true" ]]; then
+        build_project_cache
+        return
+    fi
+
+    if ! cache_is_fresh; then
+        build_project_cache
     fi
 }
 
-# Get recently modified folders
-get_folders() {
-    local base_path="$1"
-    
-    # Use ls to list directories sorted by modification time (newest first)
-    ls -1td "$base_path"/*/ 2>/dev/null
+load_projects_from_cache() {
+    PROJECT_NAMES=()
+    PROJECT_PATHS=()
+    PROJECT_MTIMES=()
+
+    cache_header_valid || return 0
+
+    local -a raw_names=()
+    local -a raw_paths=()
+    local -a raw_mtimes=()
+    local -A path_to_index=()
+    local -A used=()
+
+    local line_number=0
+    while IFS=$'\t' read -r mtime name path; do
+        ((line_number += 1))
+
+        if (( line_number == 1 )); then
+            continue
+        fi
+
+        [[ -n "$path" ]] || continue
+
+        raw_mtimes+=("$mtime")
+        raw_names+=("$name")
+        raw_paths+=("$path")
+    done < "$PROJECT_CACHE_FILE"
+
+    local i
+    for i in "${!raw_paths[@]}"; do
+        path_to_index["${raw_paths[$i]}"]="$i"
+    done
+
+    if [[ -f "$RECENTS_FILE" ]]; then
+        while IFS= read -r recent_path; do
+            [[ -n "$recent_path" ]] || continue
+
+            local idx="${path_to_index[$recent_path]:-}"
+            [[ -n "$idx" ]] || continue
+            [[ -n "${used[$idx]:-}" ]] && continue
+
+            PROJECT_NAMES+=("${raw_names[$idx]}")
+            PROJECT_PATHS+=("${raw_paths[$idx]}")
+            PROJECT_MTIMES+=("${raw_mtimes[$idx]}")
+            used["$idx"]=1
+        done < "$RECENTS_FILE"
+    fi
+
+    for i in "${!raw_paths[@]}"; do
+        [[ -n "${used[$i]:-}" ]] && continue
+
+        PROJECT_NAMES+=("${raw_names[$i]}")
+        PROJECT_PATHS+=("${raw_paths[$i]}")
+        PROJECT_MTIMES+=("${raw_mtimes[$i]}")
+    done
 }
 
-# Create new project folder
-create_new_project() {
-    gum style --foreground 212 --bold "Create New Project"
-    echo ""
-    
-    # Get project name from user
-    local project_name
-    project_name=$(gum input --placeholder "Enter project name")
-    
-    if [[ -z "$project_name" ]]; then
-        gum style --foreground 208 "No project name provided. Goodbye!"
-        exit 0
-    fi
-    
-    # Clean up project name (remove special characters, replace spaces with hyphens)
-    project_name=$(echo "$project_name" | sed 's/[^a-zA-Z0-9 _-]//g' | sed 's/ /-/g')
-    
-    if [[ -z "$project_name" ]]; then
-        gum style --foreground 196 "Error: Invalid project name after cleanup"
-        exit 1
-    fi
-    
-    local project_path="$PROJECTS_PATH/$project_name"
-    
-    # Check if folder already exists
+print_help() {
+    cat <<EOF
+$APP_NAME $VERSION
+
+Usage:
+  $APP_NAME                     Interactive picker
+  $APP_NAME <query>             Quick-open best matching project
+  $APP_NAME open <query>        Explicit quick-open command
+  $APP_NAME new <name>          Create project and open it
+  $APP_NAME browse [query]      Browse subfolders in a project
+  $APP_NAME list                List indexed projects
+  $APP_NAME refresh             Rebuild project index cache
+  $APP_NAME path                Print configured projects path
+  $APP_NAME init                Re-run setup
+  $APP_NAME config              Print loaded config
+  $APP_NAME help                Show this message
+
+Config file: $CONFIG_FILE
+Cache file:  $PROJECT_CACHE_FILE
+EOF
+}
+
+print_config() {
+    cat <<EOF
+PROJECTS_PATH=$PROJECTS_PATH
+EDITOR_CMD=$EDITOR_CMD
+CACHE_TTL_SECONDS=$CACHE_TTL_SECONDS
+MAX_RECENTS=$MAX_RECENTS
+CONFIG_FILE=$CONFIG_FILE
+PROJECT_CACHE_FILE=$PROJECT_CACHE_FILE
+RECENTS_FILE=$RECENTS_FILE
+EOF
+}
+
+create_project() {
+    local raw_name="$1"
+    local normalized_name
+
+    normalized_name="$(normalize_project_name "$raw_name")"
+    [[ -n "$normalized_name" ]] || die "Project name is empty after cleanup"
+
+    local project_path="$PROJECTS_PATH/$normalized_name"
+
     if [[ -d "$project_path" ]]; then
-        gum style --foreground 208 "Folder '$project_name' already exists. Opening existing folder..."
-        code "$project_path"
-        exit 0
+        style_message 208 "Project '$normalized_name' already exists. Opening it."
+        open_path_in_editor "$project_path"
+        return
     fi
-    
-    # Create the folder
-    if mkdir -p "$project_path"; then
-        gum style --foreground 46 "Created project: $project_name"
-        gum style --foreground 46 "Opening: $project_name"
-        code "$project_path"
-        exit 0
-    else
-        gum style --foreground 196 "Error: Failed to create project folder"
-        exit 1
-    fi
+
+    mkdir -p "$project_path"
+    style_message 46 "Created project: $normalized_name"
+
+    build_project_cache
+    open_path_in_editor "$project_path"
 }
 
-# Explore subfolders of a selected folder
-explore_subfolders() {
-    local parent_folder="$1"
-    local parent_name="$2"
-    
-    # Get subfolders
-    local subfolders=()
-    while IFS= read -r -d '' subfolder; do
-        subfolders+=("$subfolder")
-    done < <(find "$parent_folder" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null | sort -z)
-    
-    if [[ ${#subfolders[@]} -eq 0 ]]; then
-        gum style --foreground 208 "No subfolders found in $parent_name"
-        sleep 1
+prompt_new_project() {
+    local project_name=""
+
+    if has_gum; then
+        project_name=$(gum input --placeholder "Project name")
+    else
+        printf 'Project name: '
+        read -r project_name
+    fi
+
+    project_name="$(trim_whitespace "$project_name")"
+
+    if [[ -z "$project_name" ]]; then
         return 1
     fi
-    
-    # Prepare subfolder options
-    local sub_options=()
-    local sub_paths=()
-    
-    # Add back navigation option
-    sub_options+=("← Back to main menu")
-    sub_paths+=("__BACK__")
-    
-    # Add parent folder as an option
-    sub_options+=("📁 Open $parent_name (parent folder)")
-    sub_paths+=("$parent_folder")
-    
-    # Add subfolders
-    for subfolder in "${subfolders[@]}"; do
-        local subfolder_name=$(basename "$subfolder")
-        sub_options+=("  $subfolder_name/")
-        sub_paths+=("$subfolder")
-    done
-    
-    # Display submenu
-    gum style --foreground 75 --bold "Subfolders in: $parent_name"
-    echo ""
-    
-    local selected_sub
-    selected_sub=$(printf '%s\n' "${sub_options[@]}" | gum filter --height 20 --indicator "▸" --prompt ">" --placeholder "")
-    
-    if [[ -n "$selected_sub" ]]; then
-        # Find the selected path
-        for i in "${!sub_options[@]}"; do
-            if [[ "${sub_options[$i]}" == "$selected_sub" ]]; then
-                local chosen_path="${sub_paths[$i]}"
-                
-                if [[ "$chosen_path" == "__BACK__" ]]; then
-                    return 1  # Signal to go back
-                else
-                    gum style --foreground 46 "Opening: $(basename "$chosen_path")"
-                    code "$chosen_path"
-                    
-                    # Close the terminal
-                    kill -HUP $PPID 2>/dev/null
-                    exit 0
-                fi
-            fi
-        done
-    else
-        return 1  # User cancelled, go back
-    fi
+
+    create_project "$project_name"
 }
 
-# Display project selection menu using gum filter for fuzzy finding
-display_menu() {
-    local folders=("$@")
-    
+select_project_interactive() {
+    local mode="${1:-main}"
+    local prompt="${2:-project> }"
+
+    local -a labels=()
+    local -a targets=()
+
+    if [[ "$mode" == "main" ]]; then
+        labels+=("+ Create new project")
+        targets+=("__ACTION_NEW__")
+        labels+=("~ Refresh project index")
+        targets+=("__ACTION_REFRESH__")
+        labels+=("> Browse project tree")
+        targets+=("__ACTION_BROWSE__")
+    fi
+
+    local i
+    for i in "${!PROJECT_NAMES[@]}"; do
+        labels+=("${PROJECT_NAMES[$i]}")
+        targets+=("${PROJECT_PATHS[$i]}")
+    done
+
+    if (( ${#labels[@]} == 0 )); then
+        return 1
+    fi
+
+    local selected=""
+    selected=$(printf '%s\n' "${labels[@]}" | gum filter --height 20 --indicator "▸" --prompt "$prompt" --placeholder "Type to filter") || true
+
+    [[ -n "$selected" ]] || return 1
+
+    for i in "${!labels[@]}"; do
+        if [[ "${labels[$i]}" == "$selected" ]]; then
+            printf '%s\n' "${targets[$i]}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+choose_from_indices() {
+    local -a indices=("$@")
+
+    if (( ${#indices[@]} == 0 )); then
+        return 1
+    fi
+
+    if (( ${#indices[@]} == 1 )); then
+        local only_idx="${indices[0]}"
+        printf '%s\n' "${PROJECT_PATHS[$only_idx]}"
+        return 0
+    fi
+
+    if ! has_gum; then
+        style_message 208 "Multiple matches found. Install gum for interactive disambiguation."
+        local idx
+        for idx in "${indices[@]}"; do
+            printf '%s\t%s\n' "${PROJECT_NAMES[$idx]}" "${PROJECT_PATHS[$idx]}"
+        done
+        return 1
+    fi
+
+    local -a labels=()
+    local -a targets=()
+    local idx
+
+    for idx in "${indices[@]}"; do
+        labels+=("${PROJECT_NAMES[$idx]}")
+        targets+=("${PROJECT_PATHS[$idx]}")
+    done
+
+    local selected=""
+    selected=$(printf '%s\n' "${labels[@]}" | gum filter --height 15 --indicator "▸" --prompt "match> " --placeholder "Multiple matches") || true
+
+    [[ -n "$selected" ]] || return 1
+
+    for idx in "${!labels[@]}"; do
+        if [[ "${labels[$idx]}" == "$selected" ]]; then
+            printf '%s\n' "${targets[$idx]}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+resolve_project_by_query() {
+    local query="$1"
+    local needle="${query,,}"
+
+    local -a exact=()
+    local -a prefix=()
+    local -a contains=()
+
+    local i
+    for i in "${!PROJECT_NAMES[@]}"; do
+        local candidate="${PROJECT_NAMES[$i],,}"
+
+        if [[ "$candidate" == "$needle" ]]; then
+            exact+=("$i")
+        elif [[ "$candidate" == "$needle"* ]]; then
+            prefix+=("$i")
+        elif [[ "$candidate" == *"$needle"* ]]; then
+            contains+=("$i")
+        fi
+    done
+
+    if (( ${#exact[@]} > 0 )); then
+        choose_from_indices "${exact[@]}"
+        return
+    fi
+
+    if (( ${#prefix[@]} > 0 )); then
+        choose_from_indices "${prefix[@]}"
+        return
+    fi
+
+    if (( ${#contains[@]} > 0 )); then
+        choose_from_indices "${contains[@]}"
+        return
+    fi
+
+    return 1
+}
+
+interactive_browse_tree() {
+    local root="$1"
+    local current="$root"
+    local -a stack=("$root")
+
     while true; do
-        # Prepare display options with numbered folder names and modification times
-        local options=()
-        local folder_paths=()
-        local counter=1
-        
-        # Add "Create New Project" option at the top
-        options+=("Create New Project")
-        folder_paths+=("__CREATE_NEW__")
-        
-        # Add existing folders
-        for folder in "${folders[@]}"; do
-            local folder_name=$(basename "$folder")
-            local mod_time=$(stat -c %Y "$folder" 2>/dev/null)
-            local formatted_time=$(date -d @"$mod_time" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "Unknown")
-            
-            # Store the numbered display string and the actual path separately
-            options+=("$counter. $folder_name ($formatted_time)")
-            folder_paths+=("$folder")
-            ((counter++))
-        done
-        
-        # If no existing folders, still show the create option
-        if [[ ${#folders[@]} -eq 0 ]]; then
-            gum style --foreground 208 "No existing folders found in $PROJECTS_PATH"
-            echo ""
-        fi
-        
-        # Use gum filter for fuzzy finding
-        gum style --foreground 75 --bold "Projects (start typing to filter, press Ctrl+O then 'e' for subfolders)"
-        echo ""
-        
-        local selected_option 
-        selected_option=$(printf '%s\n' "${options[@]}" | gum filter --height 20 --indicator "▸" --prompt ">" --placeholder "")
-        
-        # Handle the selection
-        if [[ -n "$selected_option" ]]; then
-            # Check if "Create New Project" was selected
-            if [[ "$selected_option" == "Create New Project" ]]; then
-                create_new_project
-            else
-                # Find the selected folder path
-                for i in "${!options[@]}"; do
-                    if [[ "${options[$i]}" == "$selected_option" ]]; then
-                        local chosen_folder="${folder_paths[$i]}"
-                        local folder_name=$(basename "$chosen_folder")
-                        
-                        # Ask user what to do with the folder
-                        gum style --foreground 75 "Selected: $folder_name"
-                        local action
-                        action=$(printf '%s\n' "Open in VS Code" "Explore subfolders" "Cancel" | gum choose --header "What would you like to do?")
-                        
-                        case "$action" in
-                            "Open in VS Code")
-                                gum style --foreground 46 "Opening: $folder_name"
-                                code "$chosen_folder"
-                                kill -HUP $PPID 2>/dev/null
-                                exit 0
-                                ;;
-                            "Explore subfolders")
-                                if ! explore_subfolders "$chosen_folder" "$folder_name"; then
-                                    # User went back, continue the loop to show main menu again
-                                    continue
-                                fi
-                                ;;
-                            *)
-                                # Cancel or empty, go back to menu
-                                continue
-                                ;;
-                        esac
-                        
-                        break
-                    fi
-                done
-            fi
+        local -a labels=()
+        local -a targets=()
+
+        labels+=("Open this folder")
+        targets+=("$current")
+
+        if (( ${#stack[@]} > 1 )); then
+            labels+=("Back")
+            targets+=("__BACK__")
         else
-            gum style --foreground 208 "Goodbye!"
-            exit 0
+            labels+=("Exit browse")
+            targets+=("__EXIT__")
         fi
+
+        while IFS=$'\t' read -r name path; do
+            [[ -n "$path" ]] || continue
+            labels+=("$name/")
+            targets+=("$path")
+        done < <(
+            find "$current" -mindepth 1 -maxdepth 1 -type d -printf '%f\t%p\n' 2>/dev/null | LC_ALL=C sort -f
+        )
+
+        local rel="."
+        if [[ "$current" != "$root" ]]; then
+            rel="${current#"$root"/}"
+        fi
+
+        local selected=""
+        selected=$(printf '%s\n' "${labels[@]}" | gum filter --height 20 --indicator "▸" --prompt "browse:$rel> " --placeholder "Select folder") || true
+
+        [[ -n "$selected" ]] || return 1
+
+        local i
+        for i in "${!labels[@]}"; do
+            if [[ "${labels[$i]}" != "$selected" ]]; then
+                continue
+            fi
+
+            local target="${targets[$i]}"
+
+            if [[ "$target" == "__BACK__" ]]; then
+                unset "stack[$((${#stack[@]} - 1))]"
+                current="${stack[$((${#stack[@]} - 1))]}"
+            elif [[ "$target" == "__EXIT__" ]]; then
+                return 1
+            elif [[ "$target" == "$current" ]]; then
+                open_path_in_editor "$current"
+                return 0
+            else
+                stack+=("$target")
+                current="$target"
+            fi
+
+            break
+        done
     done
 }
 
-# Main function
-main() {
+run_browse_mode() {
+    local query="${1:-}"
 
-    # Check if required tools exist
+    has_gum || die "Browse mode requires gum"
 
-    if ! command -v gum &> /dev/null; then
-        echo "Error: 'gum' is required but not installed."
-        echo "Try apt/dnf/brew install gum"
+    ensure_project_cache false
+    load_projects_from_cache
+
+    if (( ${#PROJECT_PATHS[@]} == 0 )); then
+        die "No projects found in $PROJECTS_PATH"
     fi
 
-    if ! command -v code &> /dev/null; then
-        gum style --foreground 196 "Error: VSCode 'code' command not found"
-        echo "Please install VSCode and ensure the 'code' command is in your PATH"
-        exit 1
+    local project_path=""
+
+    if [[ -n "$query" ]]; then
+        project_path="$(resolve_project_by_query "$query" || true)"
+        [[ -n "$project_path" ]] || die "No project matched '$query'"
+    else
+        project_path="$(select_project_interactive plain "browse> " || true)"
+        [[ -n "$project_path" ]] || return 1
     fi
-    
-    # Initialize or load config
-    init_config
-    load_config
-    
-    # Validate projects path
-    if [[ ! -d "$PROJECTS_PATH" ]]; then
-        gum style --foreground 196 "Error: Projects path '$PROJECTS_PATH' does not exist"
-        echo "Please check your configuration in $CONFIG_FILE"
-        exit 1
-    fi
-    
-    # Get folders
-    mapfile -t folders < <(get_folders "$PROJECTS_PATH")
-    
-    # Display menu (handles empty folder case internally)
-    display_menu "${folders[@]}"
+
+    interactive_browse_tree "$project_path"
 }
 
-# Run main function
+run_interactive_main() {
+    has_gum || die "Interactive mode requires gum"
+
+    ensure_project_cache false
+    load_projects_from_cache
+
+    while true; do
+        local selection=""
+
+        selection="$(select_project_interactive main "project> " || true)"
+
+        if [[ -z "$selection" ]]; then
+            style_message 208 "Goodbye"
+            return
+        fi
+
+        case "$selection" in
+            "__ACTION_NEW__")
+                prompt_new_project || true
+                ensure_project_cache true
+                load_projects_from_cache
+                ;;
+            "__ACTION_REFRESH__")
+                style_message 75 "Refreshing project index..."
+                ensure_project_cache true
+                load_projects_from_cache
+                ;;
+            "__ACTION_BROWSE__")
+                run_browse_mode "" || true
+                ensure_project_cache false
+                load_projects_from_cache
+                ;;
+            *)
+                open_path_in_editor "$selection"
+                return
+                ;;
+        esac
+    done
+}
+
+list_projects() {
+    ensure_project_cache false
+    load_projects_from_cache
+
+    if (( ${#PROJECT_PATHS[@]} == 0 )); then
+        return
+    fi
+
+    local i
+    for i in "${!PROJECT_PATHS[@]}"; do
+        printf '%s\t%s\n' "${PROJECT_NAMES[$i]}" "${PROJECT_PATHS[$i]}"
+    done
+}
+
+open_by_query() {
+    local query="$1"
+
+    ensure_project_cache false
+    load_projects_from_cache
+
+    if (( ${#PROJECT_PATHS[@]} == 0 )); then
+        die "No projects found in $PROJECTS_PATH"
+    fi
+
+    local project_path=""
+    project_path="$(resolve_project_by_query "$query" || true)"
+
+    if [[ -z "$project_path" ]]; then
+        die "No project matched '$query'"
+    fi
+
+    open_path_in_editor "$project_path"
+}
+
+main() {
+    local command="${1:-}"
+
+    if [[ "$command" == "help" || "$command" == "--help" || "$command" == "-h" ]]; then
+        print_help
+        return
+    fi
+
+    if [[ "$command" == "version" || "$command" == "--version" || "$command" == "-v" ]]; then
+        printf '%s %s\n' "$APP_NAME" "$VERSION"
+        return
+    fi
+
+    if [[ "$command" == "init" ]]; then
+        run_setup true
+        return
+    fi
+
+    load_config
+
+    case "$command" in
+        "")
+            run_interactive_main
+            ;;
+        "open")
+            shift
+            [[ $# -gt 0 ]] || die "Usage: $APP_NAME open <query>"
+            open_by_query "$*"
+            ;;
+        "new")
+            shift
+            if [[ $# -gt 0 ]]; then
+                create_project "$*"
+            else
+                prompt_new_project || true
+            fi
+            ;;
+        "browse")
+            shift
+            run_browse_mode "$*"
+            ;;
+        "list")
+            list_projects
+            ;;
+        "refresh")
+            ensure_project_cache true
+            style_message 46 "Project index refreshed"
+            ;;
+        "path")
+            printf '%s\n' "$PROJECTS_PATH"
+            ;;
+        "config")
+            print_config
+            ;;
+        *)
+            open_by_query "$*"
+            ;;
+    esac
+}
+
 main "$@"
